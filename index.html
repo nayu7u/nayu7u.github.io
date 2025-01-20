@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DuckDB SQL Runner</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 20px;
+      }
+      textarea {
+        width: 100%;
+        height: 100px;
+        font-family: monospace;
+        font-size: 14px;
+        margin-bottom: 10px;
+      }
+      button {
+        padding: 10px 20px;
+        font-size: 16px;
+        cursor: pointer;
+      }
+      .output {
+        margin-top: 20px;
+        border: 1px solid #ccc;
+        padding: 10px;
+        background: #f9f9f9;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      #nameSelect option, #nameSelect {
+        font-size: 2em; /* フォントサイズを大きくする */
+      }
+      select, option {
+        font-family: Arial, "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+      }
+      #queryResults th, td {
+        font-size: 2em; /* フォントサイズを大きくする */
+      }
+    </style>
+  </head>
+  <body>
+    <div class="output">
+      <h2>Results</h2>
+      <select id="nameSelect">
+        <!-- Options will be inserted here -->
+      </select>
+      <button id="searchName">Search</button>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Unicode</th>
+          </tr>
+        </thead>
+        <tbody id="queryResults">
+          <!-- Results will be inserted here -->
+        </tbody>
+      </table>
+    </div>
+    <script>
+      const getDb = async () => {
+        if (window._db) return window._db;
+
+        const duckdb = window.duckdb;
+        const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
+        const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
+        const worker_url = URL.createObjectURL(
+          new Blob([`importScripts("${bundle.mainWorker}");`], {
+            type: "text/javascript",
+          })
+        );
+        const worker = new Worker(worker_url);
+        const logger = new duckdb.ConsoleLogger();
+        const db = new duckdb.AsyncDuckDB(logger, worker);
+        await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+        URL.revokeObjectURL(worker_url);
+        window._db = db;
+        await initializeParquet(db);
+        return db;
+      };
+
+      const initializeParquet = async (db) => {
+        const conn = await db.connect();
+        try {
+          const res = await fetch("df.parquet");
+          await db.registerFileBuffer('df.parquet', new Uint8Array(await res.arrayBuffer()));
+          const dimensions = [...Array(512).keys()].map(i => `"${i + 1}dim"`);
+          await conn.query(`
+            INSTALL parquet;
+            LOAD parquet;
+            CREATE TABLE embedding (name VARCHAR, unicode VARCHAR, ary FLOAT[512]);
+            INSERT INTO embedding SELECT name, unicode, array_value(${dimensions}) AS ary FROM read_parquet('df.parquet');
+          `);
+        } catch (error) {
+          console.error("Error loading Parquet file:", error.message);
+        } finally {
+          await conn.close();
+        }
+      };
+
+      const loadNames = async () => {
+        const nameSelect = document.getElementById("nameSelect");
+        try {
+          const db = await getDb();
+          const conn = await db.connect();
+          const namesResult = await conn.query("SELECT unicode FROM embedding");
+          const names = namesResult.toArray();
+
+          nameSelect.innerHTML = "";
+          names.forEach(row => {
+            const option = document.createElement("option");
+            option.value = row.unicode;
+            option.innerHTML = row.unicode.split('-').map(u => `&#x${u};`).join('&#x200D;');
+            nameSelect.appendChild(option);
+          });
+        } catch (error) {
+          console.error("Error loading names:", error.message);
+        }
+      };
+
+      const searchName = async () => {
+        const selectedName = document.getElementById("nameSelect").value;
+        const resultElement = document.getElementById("queryResults");
+        try {
+          const db = await getDb();
+          const conn = await db.connect();
+          const result = await conn.query(`
+            SELECT
+              name,
+              unicode,
+              array_cosine_similarity(e.ary, (SELECT ary FROM embedding WHERE unicode LIKE '%${selectedName}%')) AS similarity 
+            FROM embedding AS e
+            ORDER BY similarity DESC
+            LIMIT 10;
+          `);
+          resultElement.innerHTML = "";
+          result.toArray().forEach(row => {
+            const tr = resultElement.insertRow(-1);
+            const tdName = tr.insertCell(-1);
+            tdName.textContent = row.name;
+            const tdUnicode = tr.insertCell(-1);
+            tdUnicode.innerHTML = row.unicode.split('-').map(u => `&#x${u};`).join('&#x200D;');
+          });
+        } catch (error) {
+          resultElement.textContent = `Error: ${error.message}`;
+        }
+      };
+
+      document.getElementById("searchName").addEventListener("click", searchName);
+      window.addEventListener("load", loadNames);
+    </script>
+    <script type="module">
+      import * as duckdbduckdbWasm from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm'
+      window.duckdb = duckdbduckdbWasm;
+    </script>
+  </body>
+</html>
